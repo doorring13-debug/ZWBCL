@@ -6420,6 +6420,7 @@ const CLAN_NAME_PATTERN = /^[A-Za-z0-9]{1,4}$/;
 const CLAN_MAX_MEMBERS = 6;
 const CLAN_DESCRIPTION_MAX_LENGTH = 50;
 const CLAN_ICON_MAX_BYTES = 100 * 1024;
+const CLAN_ICON_MAX_DIMENSION = 4096;
 
 function normalizeClanName(value) {
     return String(value || '').trim().toUpperCase();
@@ -6429,19 +6430,222 @@ function normalizeClanDescription(value) {
     return String(value || '').trim().slice(0, CLAN_DESCRIPTION_MAX_LENGTH);
 }
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function isValidClanPng(data) {
+    if (data.length < PNG_SIGNATURE.length + 12 || !data.subarray(0, 8).equals(PNG_SIGNATURE)) return false;
+
+    let offset = 8;
+    let sawHeader = false;
+    let sawData = false;
+    let sawEnd = false;
+
+    while (offset + 12 <= data.length) {
+        const chunkLength = data.readUInt32BE(offset);
+        const chunkType = data.toString('ascii', offset + 4, offset + 8);
+        const chunkEnd = offset + 12 + chunkLength;
+
+        if (!/^[A-Za-z]{4}$/.test(chunkType) || chunkEnd > data.length) return false;
+
+        if (chunkType === 'IHDR') {
+            if (sawHeader || offset !== 8 || chunkLength !== 13) return false;
+
+            const width = data.readUInt32BE(offset + 8);
+            const height = data.readUInt32BE(offset + 12);
+            const bitDepth = data[offset + 16];
+            const colorType = data[offset + 17];
+
+            const validBitDepths = {
+                0: [1, 2, 4, 8, 16],
+                2: [8, 16],
+                3: [1, 2, 4, 8],
+                4: [8, 16],
+                6: [8, 16],
+            };
+
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+                || !validBitDepths[colorType]?.includes(bitDepth)
+            ) {
+                return false;
+            }
+
+            sawHeader = true;
+        } else if (chunkType === 'IDAT') {
+            if (!sawHeader || sawEnd) return false;
+            sawData = sawData || chunkLength > 0;
+        } else if (chunkType === 'IEND') {
+            if (!sawHeader || !sawData || chunkLength !== 0) return false;
+            sawEnd = true;
+            offset = chunkEnd;
+            break;
+        }
+
+        offset = chunkEnd;
+    }
+
+    return sawHeader && sawData && sawEnd && offset === data.length;
+}
+
+function isJpegSofMarker(marker) {
+    return (
+        (marker >= 0xc0 && marker <= 0xc3)
+        || (marker >= 0xc5 && marker <= 0xc7)
+        || (marker >= 0xc9 && marker <= 0xcb)
+        || (marker >= 0xcd && marker <= 0xcf)
+    );
+}
+
+function isValidClanJpeg(data) {
+    if (data.length < 4 || data[0] !== 0xff || data[1] !== 0xd8) return false;
+
+    let offset = 2;
+    let sawSof = false;
+
+    while (offset + 1 < data.length) {
+        if (data[offset] !== 0xff) return false;
+        while (offset < data.length && data[offset] === 0xff) offset++;
+        if (offset >= data.length) return false;
+
+        const marker = data[offset++];
+        if (marker === 0xd9) return sawSof;
+        if (marker === 0x00) return false;
+
+        if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+
+        if (offset + 2 > data.length) return false;
+        const segmentLength = data.readUInt16BE(offset);
+        if (segmentLength < 2 || offset + segmentLength > data.length) return false;
+
+        if (isJpegSofMarker(marker)) {
+            if (segmentLength < 7) return false;
+            const height = data.readUInt16BE(offset + 3);
+            const width = data.readUInt16BE(offset + 5);
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            sawSof = true;
+        }
+
+        if (marker === 0xda) {
+            const eoi = data.lastIndexOf(Buffer.from([0xff, 0xd9]));
+            return sawSof && eoi >= offset + segmentLength;
+        }
+
+        offset += segmentLength;
+    }
+
+    return false;
+}
+
+function readUint24LE(buffer, offset) {
+    return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+}
+
+function isValidClanWebp(data) {
+    if (data.length < 16) return false;
+    if (data.toString('ascii', 0, 4) !== 'RIFF' || data.toString('ascii', 8, 12) !== 'WEBP') return false;
+    if (data.readUInt32LE(4) !== data.length - 8) return false;
+
+    let offset = 12;
+    let hasImageChunk = false;
+
+    while (offset + 8 <= data.length) {
+        const chunkType = data.toString('ascii', offset, offset + 4);
+        const chunkSize = data.readUInt32LE(offset + 4);
+        const chunkDataEnd = offset + 8 + chunkSize;
+        const paddedEnd = chunkDataEnd + (chunkSize & 1);
+
+        if (!/^[\x20-\x7e]{4}$/.test(chunkType) || chunkDataEnd > data.length || paddedEnd > data.length) return false;
+
+        if (chunkType === 'VP8 ') {
+            if (chunkSize < 10) return false;
+            if (data[offset + 11] !== 0x9d || data[offset + 12] !== 0x01 || data[offset + 13] !== 0x2a) return false;
+
+            const width = data.readUInt16LE(offset + 14) & 0x3fff;
+            const height = data.readUInt16LE(offset + 16) & 0x3fff;
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            hasImageChunk = true;
+        } else if (chunkType === 'VP8L') {
+            if (chunkSize < 5 || data[offset + 8] !== 0x2f) return false;
+
+            const b0 = data[offset + 9];
+            const b1 = data[offset + 10];
+            const b2 = data[offset + 11];
+            const b3 = data[offset + 12];
+            const width = ((b0 | (b1 << 8)) & 0x3fff) + 1;
+            const height = (((b1 >> 6) | (b2 << 2) | ((b3 & 0x3f) << 10)) & 0x3fff) + 1;
+
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            hasImageChunk = true;
+        } else if (chunkType === 'VP8X') {
+            if (chunkSize < 10) return false;
+
+            const width = readUint24LE(data, offset + 12) + 1;
+            const height = readUint24LE(data, offset + 15) + 1;
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            hasImageChunk = true;
+        }
+
+        offset = paddedEnd;
+    }
+
+    return hasImageChunk && offset === data.length;
+}
+
+function isValidClanImageBuffer(data, mimeType) {
+    switch (String(mimeType || '').toLowerCase()) {
+        case 'image/png':
+            return isValidClanPng(data);
+        case 'image/jpeg':
+            return isValidClanJpeg(data);
+        case 'image/webp':
+            return isValidClanWebp(data);
+        default:
+            return false;
+    }
+}
+
 function parseClanIconDataUrl(value) {
-    const match = String(value || '').match(/^data:(image\/(?:webp|png|jpeg));base64,([A-Za-z0-9+/=]+)$/i);
+    const match = String(value || '').match(/^data:(image\/(?:webp|png|jpeg));base64,([A-Za-z0-9+/]+={0,2})$/i);
     if (!match) return null;
+
+    const payload = match[2];
+    if (payload.length % 4 !== 0) return null;
 
     let data;
     try {
-        data = Buffer.from(match[2], 'base64');
+        data = Buffer.from(payload, 'base64');
     } catch (_) {
         return null;
     }
 
+    if (data.toString('base64') !== payload) return null;
     if (!data.length || data.length > CLAN_ICON_MAX_BYTES) return null;
-    return { data, mimeType: match[1].toLowerCase() };
+
+    const mimeType = match[1].toLowerCase();
+    if (!isValidClanImageBuffer(data, mimeType)) return null;
+
+    return { data, mimeType };
 }
 
 function parseClanArray(value) {
@@ -6859,7 +7063,7 @@ app.post('/api/clans', async (req, res) => {
 
     const name = normalizeClanName(req.body?.name);
     const description = normalizeClanDescription(req.body?.description);
-    const icon = parseClanIconDataUrl(req.body?.iconDataUrl);
+    const icon = parseClanIconDataUrl(req.body?.data);
 
     if (!CLAN_NAME_PATTERN.test(name)) return res.status(400).json({ error: 'Clan names must be 1–4 letters or numbers.' });
     if (!icon) return res.status(400).json({ error: 'Please upload a valid clan icon.' });
@@ -6923,8 +7127,8 @@ app.patch('/api/clans/:clanId', async (req, res) => {
             add('name', name);
         }
         if (req.body?.description !== undefined) add('description', normalizeClanDescription(req.body.description));
-        if (req.body?.iconDataUrl) {
-            const icon = parseClanIconDataUrl(req.body.iconDataUrl);
+        if (req.body?.data !== undefined) {
+            const icon = parseClanIconDataUrl(req.body.data);
             if (!icon) return res.status(400).json({ error: 'Please upload a valid clan icon.' });
             add('icon_data', icon.data);
             add('icon_mime', icon.mimeType);

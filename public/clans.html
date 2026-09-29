@@ -1285,7 +1285,7 @@ window.WBDLIconRenderer = (() => {
                 name: document.getElementById('clan-name-input').value,
                 description: document.getElementById('clan-description-input').value,
             };
-            if (state.compressedIcon) payload.iconDataUrl = state.compressedIcon;
+            if (state.compressedIcon) payload.data = state.compressedIcon;
             if (!state.editing && !state.compressedIcon) {
                 error.textContent = 'Please upload a clan icon.';
                 error.style.display = 'block';
